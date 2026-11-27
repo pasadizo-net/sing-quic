@@ -1,0 +1,145 @@
+# Weekly upstream sync: when upstream's dev branch has new commits, merge them
+# into a new branch, vet and test the merge, and open a pull request against
+# main. Nothing reaches main without a person reading the upstream changes and
+# merging the pull request. On a merge conflict it opens an issue instead.
+#
+# It follows dev, not main: sing-box's testing branch, which Pasadizo follows,
+# pins commits of dev. Pasadizo's CI refuses a sing-quic pin that is not in
+# this repository's main, so this sync runs before Pasadizo's own.
+#
+# Two jobs, on purpose. `test` runs upstream's code and has a read-only token.
+# `open` has the token that can push and open pull requests, and runs no code
+# from the repository: it only repeats the merge of the commit `test` named.
+name: pasadizo-sync
+
+on:
+  schedule:
+    - cron: "17 2 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  UPSTREAM: https://github.com/SagerNet/sing-quic.git
+  UPSTREAM_BRANCH: dev
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.fetch.outputs.sha }}
+      skip: ${{ steps.fetch.outputs.skip }}
+      conflict: ${{ steps.merge.outputs.conflict }}
+      conflicts: ${{ steps.merge.outputs.conflicts }}
+      result: ${{ steps.test.outcome }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Find upstream's newest commit
+        id: fetch
+        run: |
+          git remote add upstream "$UPSTREAM"
+          git fetch --no-tags upstream "+refs/heads/$UPSTREAM_BRANCH:refs/upstream/$UPSTREAM_BRANCH"
+          sha="$(git rev-parse "refs/upstream/$UPSTREAM_BRANCH")"
+          echo "sha=$sha" >>"$GITHUB_OUTPUT"
+          if git merge-base --is-ancestor "$sha" HEAD; then
+            echo "Upstream ${sha:0:12} is already in main."
+            echo "skip=true" >>"$GITHUB_OUTPUT"
+          elif git ls-remote --exit-code --heads origin "sync/${sha:0:12}" >/dev/null; then
+            echo "A sync branch for ${sha:0:12} exists already; its pull request is open or was closed on purpose."
+            echo "skip=true" >>"$GITHUB_OUTPUT"
+          fi
+      - name: Merge upstream
+        id: merge
+        if: steps.fetch.outputs.skip != 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          sha="${{ steps.fetch.outputs.sha }}"
+          if ! git merge --no-ff -m "Merge upstream $UPSTREAM_BRANCH ${sha:0:12}" "$sha"; then
+            {
+              echo "conflicts<<EOF"
+              git diff --name-only --diff-filter=U | sed 's/^/- /'
+              echo "EOF"
+            } >>"$GITHUB_OUTPUT"
+            git merge --abort
+            echo "conflict=true" >>"$GITHUB_OUTPUT"
+          fi
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        if: steps.fetch.outputs.skip != 'true' && steps.merge.outputs.conflict != 'true'
+        with:
+          go-version-file: go.mod
+      # A pull request opened with the workflow's token does not start other
+      # workflows, so pasadizo-ci's steps run here.
+      - name: Vet, build and test the merge
+        id: test
+        if: steps.fetch.outputs.skip != 'true' && steps.merge.outputs.conflict != 'true'
+        continue-on-error: true
+        run: |
+          test "$(go list -m)" = github.com/sagernet/sing-quic
+          for os in linux darwin windows; do
+            GOOS=$os go vet ./...
+            GOOS=$os go build ./...
+          done
+          go test -race -count=1 ./...
+
+  open:
+    needs: test
+    if: needs.test.outputs.skip != 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      SHA: ${{ needs.test.outputs.sha }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - name: Report a conflict
+        if: needs.test.outputs.conflict == 'true'
+        env:
+          CONFLICTS: ${{ needs.test.outputs.conflicts }}
+        run: |
+          title="Upstream sync conflict at ${SHA:0:12}"
+          body="Merging upstream $UPSTREAM_BRANCH ${SHA:0:12} into main conflicts in:
+
+          $CONFLICTS
+
+          Resolve it by hand on a branch and open a pull request."
+          gh issue list --state open --search "$title in:title" --json number -q '.[].number' | grep -q . ||
+            gh issue create --title "$title" --body "$body"
+      - name: Open the pull request
+        if: needs.test.outputs.conflict != 'true'
+        env:
+          RESULT: ${{ needs.test.outputs.result }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream "$UPSTREAM"
+          git fetch --no-tags upstream "$SHA"
+          branch="sync/${SHA:0:12}"
+          git switch -c "$branch"
+          git merge --no-ff -m "Merge upstream $UPSTREAM_BRANCH ${SHA:0:12}" "$SHA"
+          git push origin "$branch"
+          result="passed"
+          [ "$RESULT" = "success" ] || result="FAILED (see the workflow run)"
+          bt='`'
+          log="$(git log --oneline --no-merges "HEAD^1..$SHA" | head -100)"
+          body="Upstream's ${bt}${UPSTREAM_BRANCH}${bt} is at ${bt}${SHA:0:12}${bt}. This merges it into main, on top of Pasadizo's commits.
+
+          Vet, build and tests: ${result}.
+
+          Upstream commits since the last merge:
+
+          ${bt}${bt}${bt}
+          ${log}
+          ${bt}${bt}${bt}
+
+          Read the upstream changes before merging: this code carries the traffic of every Pasadizo gateway. After the merge, point the ${bt}replace${bt} of ${bt}github.com/sagernet/sing-quic${bt} in Pasadizo's ${bt}go.mod${bt} at the new commit of main."
+          gh pr create --base main --head "$branch" --title "Sync upstream ${UPSTREAM_BRANCH} ${SHA:0:12}" --body "$body"

@@ -1,0 +1,37 @@
+# Pasadizo CI: vet, build and test the library on every push to main and every
+# pull request. Upstream's own workflows (lint.yml, debug.yml) are removed
+# here: they run on the branch name main, which this repository also uses.
+name: pasadizo-ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version-file: go.mod
+      - name: The module path is still upstream's
+        # Pasadizo takes this repository with a `replace` of
+        # github.com/sagernet/sing-quic, which needs the same module path.
+        run: test "$(go list -m)" = github.com/sagernet/sing-quic
+      - name: Vet and build (linux, darwin, windows)
+        run: |
+          for os in linux darwin windows; do
+            GOOS=$os go vet ./...
+            GOOS=$os go build ./...
+          done
+      - name: Test
+        run: go test -race -count=1 ./...
