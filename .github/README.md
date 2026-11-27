@@ -19,8 +19,7 @@ This repository is [sing-quic](https://github.com/SagerNet/sing-quic), the libra
 
 | Change | Files |
 | --- | --- |
-
-None yet: `main` is upstream's `dev` at the commit that Pasadizo pins, plus the workflows and this file. Each change is added by a pull request and listed here.
+| `(*hysteria2.Client).ConnectionStats()` returns the statistics of the client's QUIC connection (round trip times, congestion window, bytes and packets sent, received and lost), and whether it has an open connection at all. Pasadizo reads it to tell a dead path from a slow destination without sending test traffic. | `hysteria2/client_stats.go`, `hysteria2/client_stats_test.go` |
 
 Changes go into new files where that is possible, so that a merge of upstream seldom conflicts, and each is written so that it can be offered upstream as it is.
 
