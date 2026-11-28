@@ -48,6 +48,10 @@ type ServiceOptions struct {
 	MasqueradeHandler     http.Handler
 	BBRProfile            string
 	RealmOptions          *realm.Options
+
+	// CarefulResume, if not nil, makes BBR use Careful Resume (RFC 9959) with
+	// the congestion control parameters saved there for the peer's address.
+	CarefulResume *congestion_meta2.CarefulResumeStore
 }
 
 type ServerHandler interface {
@@ -75,6 +79,7 @@ type Service[U comparable] struct {
 	masqueradeHandler     http.Handler
 	quicListener          io.Closer
 	bbrProfile            congestion_meta2.Profile
+	carefulResume         *congestion_meta2.CarefulResumeStore
 	realmServer           *realm.Server
 }
 
@@ -144,6 +149,7 @@ func NewService[U comparable](options ServiceOptions) (*Service[U], error) {
 		handler:               options.Handler,
 		masqueradeHandler:     options.MasqueradeHandler,
 		bbrProfile:            bbrProfile,
+		carefulResume:         options.CarefulResume,
 		realmServer:           realmServer,
 	}, nil
 }
@@ -278,9 +284,12 @@ func (s *serverSession[U]) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 			s.quicConn.SetCongestionControl(hyCC.NewBrutalSender(rx, s.quicConn.InitialPacketSize(), s.brutalDebug, s.logger))
 		} else {
-			s.quicConn.SetCongestionControl(congestion_meta2.NewBbrSenderWithProfile(
+			s.quicConn.SetCongestionControl(congestion_meta2.NewBbrSenderWithCarefulResume(
 				s.quicConn.InitialPacketSize(),
 				s.bbrProfile,
+				s.carefulResume,
+				s.quicConn.RemoteAddr(),
+				s.logger,
 			))
 			rxAuto = true
 		}

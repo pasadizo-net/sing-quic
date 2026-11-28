@@ -53,6 +53,10 @@ type ClientOptions struct {
 	BBRProfile         string
 	ChromeParrot       bool
 	RealmOptions       *realm.Options
+
+	// CarefulResume, if not nil, makes BBR use Careful Resume (RFC 9959) with
+	// the congestion control parameters saved there for the peer's address.
+	CarefulResume *congestion_meta2.CarefulResumeStore
 }
 
 type Client struct {
@@ -75,6 +79,7 @@ type Client struct {
 	quicConfig         *quic.Config
 	udpDisabled        bool
 	bbrProfile         congestion_meta2.Profile
+	carefulResume      *congestion_meta2.CarefulResumeStore
 	realmOptions       *realm.Options
 	controlClient      *realm.ControlClient
 
@@ -166,6 +171,7 @@ func NewClient(options ClientOptions) (*Client, error) {
 		quicConfig:         quicConfig,
 		udpDisabled:        options.UDPDisabled,
 		bbrProfile:         bbrProfile,
+		carefulResume:      options.CarefulResume,
 		realmOptions:       options.RealmOptions,
 		controlClient:      controlClient,
 	}, nil
@@ -595,9 +601,12 @@ func (c *Client) authenticateAndWrap(ctx context.Context, rawConn io.Closer, cre
 	if !authResponse.RxAuto && actualTx > 0 {
 		quicConn.SetCongestionControl(hyCC.NewBrutalSender(actualTx, quicConn.InitialPacketSize(), c.brutalDebug, c.logger))
 	} else {
-		quicConn.SetCongestionControl(congestion_meta2.NewBbrSenderWithProfile(
+		quicConn.SetCongestionControl(congestion_meta2.NewBbrSenderWithCarefulResume(
 			quicConn.InitialPacketSize(),
 			c.bbrProfile,
+			c.carefulResume,
+			quicConn.RemoteAddr(),
+			c.logger,
 		))
 	}
 	conn := &clientQUICConnection{
