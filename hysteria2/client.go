@@ -56,6 +56,10 @@ type ClientOptions struct {
 	RealmOptions       *realm.Options
 	// MultipathPaths are the paths added to the connection with the multipath extension of RFC 10069.
 	MultipathPaths []MultipathPath
+
+	// CarefulResume, if not nil, makes BBR use Careful Resume (RFC 9959) with
+	// the congestion control parameters saved there for the peer's address.
+	CarefulResume *congestion_meta2.CarefulResumeStore
 }
 
 type Client struct {
@@ -78,6 +82,7 @@ type Client struct {
 	quicConfig         *quic.Config
 	udpDisabled        bool
 	bbrProfile         congestion_meta2.Profile
+	carefulResume      *congestion_meta2.CarefulResumeStore
 	realmOptions       *realm.Options
 	controlClient      *realm.ControlClient
 	multipathPaths     []MultipathPath
@@ -174,6 +179,7 @@ func NewClient(options ClientOptions) (*Client, error) {
 		quicConfig:         quicConfig,
 		udpDisabled:        options.UDPDisabled,
 		bbrProfile:         bbrProfile,
+		carefulResume:      options.CarefulResume,
 		realmOptions:       options.RealmOptions,
 		controlClient:      controlClient,
 		multipathPaths:     options.MultipathPaths,
@@ -596,7 +602,9 @@ func (c *Client) authenticateAndWrap(ctx context.Context, rawConn io.Closer, cre
 		actualTx = c.sendBPS
 	}
 	// Every path of a multipath connection gets a congestion controller of its own;
-	// with Brutal, a path can send at a bandwidth of its own.
+	// with Brutal, a path can send at a bandwidth of its own. Careful Resume applies
+	// to the first path only: the parameters saved for the server's address were
+	// measured on that path, not on the others.
 	newCC := func(sendBPS uint64) congestion.CongestionControl {
 		if !authResponse.RxAuto && actualTx > 0 {
 			if sendBPS == 0 || sendBPS > actualTx {
@@ -606,7 +614,17 @@ func (c *Client) authenticateAndWrap(ctx context.Context, rawConn io.Closer, cre
 		}
 		return congestion_meta2.NewBbrSenderWithProfile(quicConn.InitialPacketSize(), c.bbrProfile)
 	}
-	quicConn.SetCongestionControl(newCC(0))
+	if !authResponse.RxAuto && actualTx > 0 {
+		quicConn.SetCongestionControl(newCC(0))
+	} else {
+		quicConn.SetCongestionControl(congestion_meta2.NewBbrSenderWithCarefulResume(
+			quicConn.InitialPacketSize(),
+			c.bbrProfile,
+			c.carefulResume,
+			quicConn.RemoteAddr(),
+			c.logger,
+		))
+	}
 	conn := &clientQUICConnection{
 		quicConn:    quicConn,
 		rawConn:     rawConn,
