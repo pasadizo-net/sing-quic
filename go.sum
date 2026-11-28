@@ -16,8 +16,8 @@ github.com/libp2p/go-netroute v0.4.0 h1:sZZx9hyANYUx9PZyqcgE/E1GUG3iEtTZHUEvdtXT
 github.com/libp2p/go-netroute v0.4.0/go.mod h1:Nkd5ShYgSMS5MUKy/MU2T57xFoOKvvLR92Lic48LEyA=
 github.com/metacubex/utls v1.8.8 h1:7fiMYahL+tT1I/vG1MWidv88r/3A5NnPrurjzApZGyQ=
 github.com/metacubex/utls v1.8.8/go.mod h1:kncGGVhFaoGn5M3pFe3SXhZCzsbCJayNOH4UEqTKTko=
-github.com/pasadizo-net/quic-go v0.0.0-20261128121317-b9ea07a8f277 h1:SvrYw1TvF85lUBSpQp98DQp7QdqLB3IW4vxQ7/3A0Vk=
-github.com/pasadizo-net/quic-go v0.0.0-20261128121317-b9ea07a8f277/go.mod h1:Zo98Ai4X4V5LfA+9lieDJyoYRQlhMQBvVSWQgD2uNe4=
+github.com/pasadizo-net/quic-go v0.0.0-20261128121951-bb78f72c1784 h1:4iZMQ//Ats4KLwtk7wCivt6tVVFdmIMSX/hI2zvBvPM=
+github.com/pasadizo-net/quic-go v0.0.0-20261128121951-bb78f72c1784/go.mod h1:Zo98Ai4X4V5LfA+9lieDJyoYRQlhMQBvVSWQgD2uNe4=
 github.com/quic-go/qpack v0.6.0 h1:g7W+BMYynC1LbYLSqRt8PBg5Tgwxn214ZZR34VIOjz8=
 github.com/quic-go/qpack v0.6.0/go.mod h1:lUpLKChi8njB4ty2bFLX2x4gzDqXwUpaO1DP9qMDZII=
 github.com/sagernet/sing v0.9.6 h1:LXTpEMbr4G/65PSjopjfg+Zp1Xq1ilJnGWq47y/eObI=
