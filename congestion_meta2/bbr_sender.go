@@ -5,11 +5,13 @@ package congestion
 import (
 	"fmt"
 	"math/rand"
+	"net"
 	"time"
 
 	"github.com/sagernet/quic-go/congestion"
 	"github.com/sagernet/quic-go/monotime"
 	E "github.com/sagernet/sing/common/exceptions"
+	"github.com/sagernet/sing/common/logger"
 )
 
 // BbrSender implements BBR congestion control algorithm.  BBR aims to estimate
@@ -314,6 +316,9 @@ type bbrSender struct {
 	maxDatagramSize congestion.ByteCount
 	// Recorded on packet sent. equivalent |unacked_packets_->bytes_in_flight()|
 	bytesInFlight congestion.ByteCount
+
+	// Careful Resume (RFC 9959), or nil when it is off.
+	carefulResume *carefulResume
 }
 
 var _ congestion.CongestionControlEx = &bbrSender{}
@@ -328,6 +333,28 @@ func NewBbrSenderWithProfile(
 		congestion.MaxCongestionWindowPackets*initialMaxDatagramSize,
 		profile,
 	)
+}
+
+// NewBbrSenderWithCarefulResume returns a BBR sender that uses Careful Resume
+// (RFC 9959): it saves the capacity it observes to the peer at remoteAddr in
+// store, and resumes from what an earlier connection to that peer saved. The
+// phase changes are logged at the debug level when logger is not nil.
+func NewBbrSenderWithCarefulResume(
+	initialMaxDatagramSize congestion.ByteCount,
+	profile Profile,
+	store *CarefulResumeStore,
+	remoteAddr net.Addr,
+	logger logger.Logger,
+) *bbrSender {
+	b := NewBbrSenderWithProfile(initialMaxDatagramSize, profile)
+	if store != nil {
+		var log func(format string, a ...any)
+		if logger != nil {
+			log = func(format string, a ...any) { logger.Debug(fmt.Sprintf(format, a...)) }
+		}
+		b.carefulResume = newCarefulResume(store, CarefulResumeKey(remoteAddr), log)
+	}
+	return b
 }
 
 func newBbrSender(
@@ -449,10 +476,17 @@ func (b *bbrSender) OnPacketSent(
 	}
 
 	b.sampler.OnPacketSent(sentTime, packetNumber, bytes, bytesInFlight, isRetransmittable)
+
+	if b.carefulResume != nil {
+		b.carefulResume.onPacketSent(b, sentTime, bytesInFlight, packetNumber, bytes)
+	}
 }
 
 // CanSend implements the SendAlgorithm interface.
 func (b *bbrSender) CanSend(bytesInFlight congestion.ByteCount) bool {
+	if b.carefulResume != nil {
+		b.carefulResume.maybeJump(b, bytesInFlight, b.ownCongestionWindow())
+	}
 	return bytesInFlight < b.GetCongestionWindow()
 }
 
@@ -508,6 +542,15 @@ func (b *bbrSender) InRecovery() bool {
 
 // GetCongestionWindow implements the SendAlgorithmWithDebugInfos interface.
 func (b *bbrSender) GetCongestionWindow() congestion.ByteCount {
+	if b.carefulResume != nil {
+		return b.carefulResume.congestionWindow(b.ownCongestionWindow())
+	}
+	return b.ownCongestionWindow()
+}
+
+// ownCongestionWindow is BBR's congestion window before Careful Resume
+// raises or caps it.
+func (b *bbrSender) ownCongestionWindow() congestion.ByteCount {
 	if b.mode == bbrModeProbeRtt {
 		return b.probeRttCongestionWindow()
 	}
@@ -560,7 +603,8 @@ func (b *bbrSender) OnCongestionEventEx(priorInFlight congestion.ByteCount, even
 	// packets in |acked_packets| did not generate valid samples. (e.g. ack of
 	// ack-only packets). In both cases, sampler_.total_bytes_acked() will not
 	// change.
-	if totalBytesAckedBefore != b.sampler.TotalBytesAcked() {
+	if totalBytesAckedBefore != b.sampler.TotalBytesAcked() &&
+		(b.carefulResume == nil || !b.carefulResume.discardBandwidthSamples()) {
 		if !sample.sampleIsAppLimited || sample.sampleMaxBandwidth > b.maxBandwidth.GetBest() {
 			b.maxBandwidth.Update(sample.sampleMaxBandwidth, b.roundTripCount)
 		}
@@ -577,6 +621,10 @@ func (b *bbrSender) OnCongestionEventEx(priorInFlight congestion.ByteCount, even
 	if len(lostPackets) != 0 {
 		b.numLossEventsInRound++
 		b.bytesLostInRound += bytesLost
+	}
+
+	if b.carefulResume != nil {
+		b.carefulResume.onCongestionEvent(b, eventTime, ackedPackets, lostPackets)
 	}
 
 	// Handle logic specific to PROBE_BW mode.
@@ -606,16 +654,22 @@ func (b *bbrSender) OnCongestionEventEx(priorInFlight congestion.ByteCount, even
 	if isRoundStart {
 		b.numLossEventsInRound = 0
 		b.bytesLostInRound = 0
+		if b.carefulResume != nil {
+			b.carefulResume.observe(b)
+		}
 	}
 }
 
 func (b *bbrSender) PacingRate() Bandwidth {
-	if b.pacingRate == 0 {
-		return Bandwidth(b.highGain * float64(
+	rate := b.pacingRate
+	if rate == 0 {
+		rate = Bandwidth(b.highGain * float64(
 			BandwidthFromDelta(b.initialCongestionWindow, b.getMinRtt())))
 	}
-
-	return b.pacingRate
+	if b.carefulResume != nil {
+		rate = b.carefulResume.pacingRate(rate)
+	}
+	return rate
 }
 
 // Sets the CWND gain used in STARTUP.  Must be greater than 1.
