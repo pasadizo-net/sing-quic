@@ -22,8 +22,9 @@ type MultipathPath struct {
 	// Backup marks the path as a backup path: neither endpoint sends on it while
 	// another path works.
 	Backup bool
-	// SendBPS is the bandwidth Brutal sends at on this path, if the client uses Brutal.
-	// If zero, the client's SendBPS is used, as on the first path.
+	// SendBPS is the bandwidth Brutal sends at on this path, if the client uses Brutal,
+	// at most the connection's. If zero, the path uses BBR: Brutal never backs off, so
+	// the connection's bandwidth on every path would send it several times over.
 	SendBPS uint64
 }
 

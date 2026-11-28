@@ -286,11 +286,12 @@ func (s *serverSession[U]) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			if s.sendBPS > 0 && rx > s.sendBPS {
 				rx = s.sendBPS
 			}
-			newCC := func() congestion.CongestionControl {
-				return hyCC.NewBrutalSender(rx, s.quicConn.InitialPacketSize(), s.brutalDebug, s.logger)
-			}
-			s.quicConn.SetCongestionControl(newCC())
-			s.quicConn.SetPathCongestionControl(newCC)
+			s.quicConn.SetCongestionControl(hyCC.NewBrutalSender(rx, s.quicConn.InitialPacketSize(), s.brutalDebug, s.logger))
+			// The client's rx is for the whole connection, and Brutal on each path
+			// would send it on every path, so the paths a client adds use BBR.
+			s.quicConn.SetPathCongestionControl(func() congestion.CongestionControl {
+				return congestion_meta2.NewBbrSenderWithProfile(s.quicConn.InitialPacketSize(), s.bbrProfile)
+			})
 		} else {
 			// Careful Resume applies to the first path only: the parameters saved for the
 			// client's address were measured on that path, not on the paths it adds.

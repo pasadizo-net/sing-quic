@@ -601,21 +601,9 @@ func (c *Client) authenticateAndWrap(ctx context.Context, rawConn io.Closer, cre
 	if actualTx == 0 || actualTx > c.sendBPS {
 		actualTx = c.sendBPS
 	}
-	// Every path of a multipath connection gets a congestion controller of its own;
-	// with Brutal, a path can send at a bandwidth of its own. Careful Resume applies
-	// to the first path only: the parameters saved for the server's address were
-	// measured on that path, not on the others.
-	newCC := func(sendBPS uint64) congestion.CongestionControl {
-		if !authResponse.RxAuto && actualTx > 0 {
-			if sendBPS == 0 || sendBPS > actualTx {
-				sendBPS = actualTx
-			}
-			return hyCC.NewBrutalSender(sendBPS, quicConn.InitialPacketSize(), c.brutalDebug, c.logger)
-		}
-		return congestion_meta2.NewBbrSenderWithProfile(quicConn.InitialPacketSize(), c.bbrProfile)
-	}
-	if !authResponse.RxAuto && actualTx > 0 {
-		quicConn.SetCongestionControl(newCC(0))
+	brutal := !authResponse.RxAuto && actualTx > 0
+	if brutal {
+		quicConn.SetCongestionControl(hyCC.NewBrutalSender(actualTx, quicConn.InitialPacketSize(), c.brutalDebug, c.logger))
 	} else {
 		quicConn.SetCongestionControl(congestion_meta2.NewBbrSenderWithCarefulResume(
 			quicConn.InitialPacketSize(),
@@ -624,6 +612,18 @@ func (c *Client) authenticateAndWrap(ctx context.Context, rawConn io.Closer, cre
 			quicConn.RemoteAddr(),
 			c.logger,
 		))
+	}
+	// Every added path of a multipath connection gets a congestion controller of its
+	// own. Brutal never backs off, so an added path uses it only at the bandwidth of
+	// its own (MultipathPath.SendBPS) and BBR otherwise: Brutal at the connection's
+	// rate on each path would send that rate several times over. Careful Resume
+	// applies to the first path only: the parameters saved for the server's address
+	// were measured on that path.
+	newPathCC := func(sendBPS uint64) congestion.CongestionControl {
+		if brutal && sendBPS > 0 {
+			return hyCC.NewBrutalSender(min(sendBPS, actualTx), quicConn.InitialPacketSize(), c.brutalDebug, c.logger)
+		}
+		return congestion_meta2.NewBbrSenderWithProfile(quicConn.InitialPacketSize(), c.bbrProfile)
 	}
 	conn := &clientQUICConnection{
 		quicConn:    quicConn,
@@ -637,7 +637,7 @@ func (c *Client) authenticateAndWrap(ctx context.Context, rawConn io.Closer, cre
 		go c.loopMessages(conn)
 	}
 	if len(c.multipathPaths) > 0 {
-		c.openPaths(conn, newCC)
+		c.openPaths(conn, newPathCC)
 	}
 	go func() {
 		<-quicConn.Context().Done()
