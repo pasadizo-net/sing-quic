@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/sagernet/quic-go"
+	"github.com/sagernet/quic-go/congestion"
 	"github.com/sagernet/quic-go/http3"
 	"github.com/sagernet/quic-go/quicvarint"
 	qtls "github.com/sagernet/sing-quic"
@@ -48,6 +49,8 @@ type ServiceOptions struct {
 	MasqueradeHandler     http.Handler
 	BBRProfile            string
 	RealmOptions          *realm.Options
+	// Multipath accepts the paths a client adds with the multipath extension of RFC 10069.
+	Multipath bool
 }
 
 type ServerHandler interface {
@@ -90,6 +93,7 @@ func NewService[U comparable](options ServiceOptions) (*Service[U], error) {
 		MaxIdleTimeout:                 hysteria.DefaultMaxIdleTimeout,
 		KeepAlivePeriod:                hysteria.DefaultKeepAlivePeriod,
 		DisablePathManager:             true,
+		EnableMultipath:                options.Multipath,
 	}
 	qtls.ApplyQUICOptions(quicConfig, options.QUICOptions)
 	bbrProfile := congestion_meta2.ProfileStandard
@@ -276,12 +280,17 @@ func (s *serverSession[U]) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			if s.sendBPS > 0 && rx > s.sendBPS {
 				rx = s.sendBPS
 			}
-			s.quicConn.SetCongestionControl(hyCC.NewBrutalSender(rx, s.quicConn.InitialPacketSize(), s.brutalDebug, s.logger))
+			newCC := func() congestion.CongestionControl {
+				return hyCC.NewBrutalSender(rx, s.quicConn.InitialPacketSize(), s.brutalDebug, s.logger)
+			}
+			s.quicConn.SetCongestionControl(newCC())
+			s.quicConn.SetPathCongestionControl(newCC)
 		} else {
-			s.quicConn.SetCongestionControl(congestion_meta2.NewBbrSenderWithProfile(
-				s.quicConn.InitialPacketSize(),
-				s.bbrProfile,
-			))
+			newCC := func() congestion.CongestionControl {
+				return congestion_meta2.NewBbrSenderWithProfile(s.quicConn.InitialPacketSize(), s.bbrProfile)
+			}
+			s.quicConn.SetCongestionControl(newCC())
+			s.quicConn.SetPathCongestionControl(newCC)
 			rxAuto = true
 		}
 		protocol.AuthResponseToHeader(w.Header(), protocol.AuthResponse{

@@ -20,6 +20,7 @@ This repository is [sing-quic](https://github.com/SagerNet/sing-quic), the libra
 | Change | Files |
 | --- | --- |
 | `(*hysteria2.Client).ConnectionStats()` returns the statistics of the client's QUIC connection (round trip times, congestion window, bytes and packets sent, received and lost), and whether it has an open connection at all. Pasadizo reads it to tell a dead path from a slow destination without sending test traffic. | `hysteria2/client_stats.go`, `hysteria2/client_stats_test.go` |
+| Hysteria2 over several network paths with the multipath extension of QUIC ([RFC 10069](https://www.rfc-editor.org/rfc/rfc10069)): `ClientOptions.MultipathPaths` adds paths (a dialer each, for example bound to another interface, optionally a backup path and a Brutal bandwidth of its own) that the client keeps open on its connection and opens again when they close; `ServiceOptions.Multipath` accepts them. Each path gets a congestion controller of the connection's kind. It needs [pasadizo-net/quic-go](https://github.com/pasadizo-net/quic-go), which `go.mod` takes with a `replace` of `github.com/sagernet/quic-go`; a module that uses this repository needs the same `replace`, since Go ignores the `replace` directives of dependencies. | `hysteria2/multipath.go`, `hysteria2/multipath_test.go`, `hysteria2/client.go`, `hysteria2/service.go`, `go.mod` |
 
 Changes go into new files where that is possible, so that a merge of upstream seldom conflicts, and each is written so that it can be offered upstream as it is.
 
