@@ -1,9 +1,12 @@
 package congestion
 
 import (
+	"errors"
+	"fmt"
 	"math"
 	"math/rand"
 	"net"
+	"os"
 	"path/filepath"
 	"reflect"
 	"slices"
@@ -187,9 +190,7 @@ var (
 
 func newTestStore(t *testing.T) *CarefulResumeStore {
 	t.Helper()
-	store, err := NewCarefulResumeStore(time.Hour, "")
-	requireNoError(t, err)
-	return store
+	return NewCarefulResumeStore(time.Hour, "", nil)
 }
 
 func TestCarefulResumeObservesTheCapacity(t *testing.T) {
@@ -315,8 +316,7 @@ func TestCarefulResumeStoreOneConnectionAtATime(t *testing.T) {
 }
 
 func TestCarefulResumeStoreLifetime(t *testing.T) {
-	store, err := NewCarefulResumeStore(time.Minute, "")
-	requireNoError(t, err)
+	store := NewCarefulResumeStore(time.Minute, "", nil)
 	now := time.Unix(1_800_000_000, 0)
 	store.now = func() time.Time { return now }
 	store.observe("192.0.2.1", CarefulResumeParams{Bandwidth: 100e6, MinRTT: time.Millisecond, CWND: 12500}, false)
@@ -344,30 +344,104 @@ func TestCarefulResumeStoreKeepsLargerObservationWhenAppLimited(t *testing.T) {
 
 func TestCarefulResumeStoreStateFile(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "careful-resume.json")
-	store, err := NewCarefulResumeStore(time.Hour, path)
-	requireNoError(t, err)
+	store := NewCarefulResumeStore(time.Hour, path, nil)
+	store.Start()
 	p := CarefulResumeParams{Bandwidth: 160e6, MinRTT: 98 * time.Millisecond, CWND: 1960000}
-	store.observe("2001:db8::1", p, false)
+	store.observe("2001:db8::/64", p, false)
 	requireNoError(t, store.Close())
 
-	loaded, err := NewCarefulResumeStore(time.Hour, path)
-	requireNoError(t, err)
-	defer loaded.Close()
-	got, _, ok := loaded.claim("2001:db8::1")
+	loaded := NewCarefulResumeStore(time.Hour, path, nil)
+	got, _, ok := loaded.claim("2001:db8::/64")
 	requireTrue(t, ok)
 	requireEqual(t, p, got)
 
 	// Expired entries are not loaded.
-	short, err := NewCarefulResumeStore(time.Nanosecond, path)
-	requireNoError(t, err)
-	defer short.Close()
-	requireZero(t, short.Len())
+	requireZero(t, NewCarefulResumeStore(time.Nanosecond, path, nil).Len())
+}
+
+func TestCarefulResumeStoreStateFileFromTheFuture(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "careful-resume.json")
+	store := NewCarefulResumeStore(time.Hour, path, nil)
+	// Saved by a clock that ran a day ahead.
+	store.now = func() time.Time { return time.Now().Add(24 * time.Hour) }
+	store.Start()
+	store.observe("192.0.2.1", CarefulResumeParams{Bandwidth: 100e6, MinRTT: time.Millisecond, CWND: 12500}, false)
+	requireNoError(t, store.Close())
+	requireZero(t, NewCarefulResumeStore(time.Hour, path, nil).Len())
+}
+
+func TestCarefulResumeStoreBadStateFile(t *testing.T) {
+	for name, path := range map[string]string{
+		"unreadable": t.TempDir(), // a directory
+		"damaged":    filepath.Join(t.TempDir(), "careful-resume.json"),
+	} {
+		t.Run(name, func(t *testing.T) {
+			if name == "damaged" {
+				requireNoError(t, os.WriteFile(path, []byte("{not json"), 0o600))
+			}
+			var warnings []string
+			store := NewCarefulResumeStore(time.Hour, path, func(format string, a ...any) {
+				warnings = append(warnings, fmt.Sprintf(format, a...))
+			})
+			requireZero(t, store.Len())
+			requireLen(t, warnings, 1)
+		})
+	}
+}
+
+func TestCarefulResumeStoreReportsSaveErrorsOnce(t *testing.T) {
+	var warnings []string
+	store := NewCarefulResumeStore(time.Hour, filepath.Join(t.TempDir(), "missing", "careful-resume.json"), func(format string, a ...any) {
+		warnings = append(warnings, fmt.Sprintf(format, a...))
+	})
+	for range 3 {
+		store.observe("192.0.2.1", CarefulResumeParams{Bandwidth: 100e6, MinRTT: time.Millisecond, CWND: 12500}, false)
+		store.reportSaveError(store.save())
+	}
+	requireLen(t, warnings, 1)
+	requireNoError(t, os.Mkdir(filepath.Dir(store.path), 0o700))
+	store.reportSaveError(store.save())
+	requireLen(t, warnings, 2, "the recovery is reported")
+}
+
+func TestCarefulResumeStoreCloseWithoutStartWritesNothing(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "careful-resume.json")
+	store := NewCarefulResumeStore(time.Hour, path, nil)
+	store.observe("192.0.2.1", CarefulResumeParams{Bandwidth: 100e6, MinRTT: time.Millisecond, CWND: 12500}, false)
+	requireNoError(t, store.Close())
+	_, err := os.Stat(path)
+	requireErrorIs(t, err, os.ErrNotExist)
+}
+
+func TestCarefulResumeStoreIsBounded(t *testing.T) {
+	store := newTestStore(t)
+	now := time.Unix(1_800_000_000, 0)
+	store.now = func() time.Time { return now }
+	p := CarefulResumeParams{Bandwidth: 100e6, MinRTT: time.Millisecond, CWND: 12500}
+	for i := range carefulResumeMaxEntries + 10 {
+		now = now.Add(time.Millisecond)
+		store.observe(fmt.Sprintf("10.%d.%d.%d", i>>16, (i>>8)&0xff, i&0xff), p, false)
+	}
+	requireEqual(t, carefulResumeMaxEntries, store.Len())
+	// The oldest ones made room.
+	_, _, ok := store.claim("10.0.0.0")
+	requireFalse(t, ok)
+	_, _, ok = store.claim(fmt.Sprintf("10.0.%d.%d", (carefulResumeMaxEntries+9)>>8&0xff, (carefulResumeMaxEntries+9)&0xff))
+	requireTrue(t, ok)
+
+	// Expired sets are swept.
+	now = now.Add(2 * time.Hour)
+	store.mu.Lock()
+	store.sweepLocked(now)
+	store.mu.Unlock()
+	requireZero(t, store.Len())
 }
 
 func TestCarefulResumeKey(t *testing.T) {
 	requireEqual(t, "192.0.2.1", CarefulResumeKey(&net.UDPAddr{IP: net.IPv4(192, 0, 2, 1), Port: 1}))
 	requireEqual(t, "192.0.2.1", CarefulResumeKey(&net.UDPAddr{IP: net.ParseIP("::ffff:192.0.2.1"), Port: 2}))
-	requireEqual(t, "2001:db8::1", CarefulResumeKey(&net.UDPAddr{IP: net.ParseIP("2001:db8::1"), Port: 3}))
+	requireEqual(t, "2001:db8::/64", CarefulResumeKey(&net.UDPAddr{IP: net.ParseIP("2001:db8::1"), Port: 3}))
+	requireEqual(t, "2001:db8::/64", CarefulResumeKey(&net.UDPAddr{IP: net.ParseIP("2001:db8::abcd:1"), Port: 4}))
 }
 
 // Small stand-ins for testify, which this module does not use.
@@ -441,5 +515,19 @@ func requireNotContains(t *testing.T, phases []carefulResumePhase, p carefulResu
 	t.Helper()
 	if slices.Contains(phases, p) {
 		t.Fatalf("%v contains %v", phases, p)
+	}
+}
+
+func requireLen[T any](t *testing.T, s []T, n int, msg ...any) {
+	t.Helper()
+	if len(s) != n {
+		t.Fatalf("want %d items, got %d: %v %v", n, len(s), s, msg)
+	}
+}
+
+func requireErrorIs(t *testing.T, err, target error) {
+	t.Helper()
+	if !errors.Is(err, target) {
+		t.Fatalf("want %v, got %v", target, err)
 	}
 }
