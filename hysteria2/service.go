@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/sagernet/quic-go"
+	"github.com/sagernet/quic-go/congestion"
 	"github.com/sagernet/quic-go/http3"
 	"github.com/sagernet/quic-go/quicvarint"
 	qtls "github.com/sagernet/sing-quic"
@@ -48,6 +49,8 @@ type ServiceOptions struct {
 	MasqueradeHandler     http.Handler
 	BBRProfile            string
 	RealmOptions          *realm.Options
+	// Multipath accepts the paths a client adds with the multipath extension of RFC 10069.
+	Multipath bool
 
 	// CarefulResume, if not nil, makes BBR use Careful Resume (RFC 9959) with
 	// the congestion control parameters saved there for the peer's address.
@@ -95,6 +98,7 @@ func NewService[U comparable](options ServiceOptions) (*Service[U], error) {
 		MaxIdleTimeout:                 hysteria.DefaultMaxIdleTimeout,
 		KeepAlivePeriod:                hysteria.DefaultKeepAlivePeriod,
 		DisablePathManager:             true,
+		EnableMultipath:                options.Multipath,
 	}
 	qtls.ApplyQUICOptions(quicConfig, options.QUICOptions)
 	bbrProfile := congestion_meta2.ProfileStandard
@@ -283,7 +287,14 @@ func (s *serverSession[U]) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				rx = s.sendBPS
 			}
 			s.quicConn.SetCongestionControl(hyCC.NewBrutalSender(rx, s.quicConn.InitialPacketSize(), s.brutalDebug, s.logger))
+			// The client's rx is for the whole connection, and Brutal on each path
+			// would send it on every path, so the paths a client adds use BBR.
+			s.quicConn.SetPathCongestionControl(func() congestion.CongestionControl {
+				return congestion_meta2.NewBbrSenderWithProfile(s.quicConn.InitialPacketSize(), s.bbrProfile)
+			})
 		} else {
+			// Careful Resume applies to the first path only: the parameters saved for the
+			// client's address were measured on that path, not on the paths it adds.
 			s.quicConn.SetCongestionControl(congestion_meta2.NewBbrSenderWithCarefulResume(
 				s.quicConn.InitialPacketSize(),
 				s.bbrProfile,
@@ -291,6 +302,9 @@ func (s *serverSession[U]) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				s.quicConn.RemoteAddr(),
 				s.logger,
 			))
+			s.quicConn.SetPathCongestionControl(func() congestion.CongestionControl {
+				return congestion_meta2.NewBbrSenderWithProfile(s.quicConn.InitialPacketSize(), s.bbrProfile)
+			})
 			rxAuto = true
 		}
 		protocol.AuthResponseToHeader(w.Header(), protocol.AuthResponse{

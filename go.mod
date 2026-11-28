@@ -26,3 +26,5 @@ require (
 	golang.org/x/sys v0.50.0 // indirect
 	golang.org/x/text v0.44.0 // indirect
 )
+
+replace github.com/sagernet/quic-go => github.com/pasadizo-net/quic-go v0.0.0-20261128121951-bb78f72c1784

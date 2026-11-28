@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/sagernet/quic-go"
+	"github.com/sagernet/quic-go/congestion"
 	"github.com/sagernet/quic-go/http3"
 	qtls "github.com/sagernet/sing-quic"
 	congestion_meta2 "github.com/sagernet/sing-quic/congestion_meta2"
@@ -53,6 +54,8 @@ type ClientOptions struct {
 	BBRProfile         string
 	ChromeParrot       bool
 	RealmOptions       *realm.Options
+	// MultipathPaths are the paths added to the connection with the multipath extension of RFC 10069.
+	MultipathPaths []MultipathPath
 
 	// CarefulResume, if not nil, makes BBR use Careful Resume (RFC 9959) with
 	// the congestion control parameters saved there for the peer's address.
@@ -82,6 +85,7 @@ type Client struct {
 	carefulResume      *congestion_meta2.CarefulResumeStore
 	realmOptions       *realm.Options
 	controlClient      *realm.ControlClient
+	multipathPaths     []MultipathPath
 
 	connAccess sync.Mutex
 	conn       *clientQUICConnection
@@ -100,8 +104,12 @@ func NewClient(options ClientOptions) (*Client, error) {
 		MaxIdleTimeout:                 hysteria.DefaultMaxIdleTimeout,
 		KeepAlivePeriod:                hysteria.DefaultKeepAlivePeriod,
 		ChromeParrot:                   options.ChromeParrot,
+		EnableMultipath:                len(options.MultipathPaths) > 0,
 	}
 	qtls.ApplyQUICOptions(quicConfig, options.QUICOptions)
+	if err := checkMultipathOptions(options); err != nil {
+		return nil, err
+	}
 	if len(options.TLSConfig.NextProtos()) == 0 {
 		options.TLSConfig.SetNextProtos([]string{http3.NextProtoH3})
 	}
@@ -174,6 +182,7 @@ func NewClient(options ClientOptions) (*Client, error) {
 		carefulResume:      options.CarefulResume,
 		realmOptions:       options.RealmOptions,
 		controlClient:      controlClient,
+		multipathPaths:     options.MultipathPaths,
 	}, nil
 }
 
@@ -286,13 +295,7 @@ func (c *Client) offerNew(ctx context.Context) (*clientQUICConnection, error) {
 		if err != nil {
 			return nil, err
 		}
-		if c.geckoPassword == "" && c.salamanderPassword == "" {
-			return udpConn, nil
-		}
-		if c.geckoPassword != "" {
-			return NewGeckoClientConn(udpConn, []byte(c.geckoPassword), c.geckoMinPacketSize, c.geckoMaxPacketSize), nil
-		}
-		return NewSalamanderClientConn(udpConn, []byte(c.salamanderPassword)), nil
+		return c.obfuscate(udpConn), nil
 	}
 	var (
 		rawConn net.Conn
@@ -598,7 +601,8 @@ func (c *Client) authenticateAndWrap(ctx context.Context, rawConn io.Closer, cre
 	if actualTx == 0 || actualTx > c.sendBPS {
 		actualTx = c.sendBPS
 	}
-	if !authResponse.RxAuto && actualTx > 0 {
+	brutal := !authResponse.RxAuto && actualTx > 0
+	if brutal {
 		quicConn.SetCongestionControl(hyCC.NewBrutalSender(actualTx, quicConn.InitialPacketSize(), c.brutalDebug, c.logger))
 	} else {
 		quicConn.SetCongestionControl(congestion_meta2.NewBbrSenderWithCarefulResume(
@@ -608,6 +612,18 @@ func (c *Client) authenticateAndWrap(ctx context.Context, rawConn io.Closer, cre
 			quicConn.RemoteAddr(),
 			c.logger,
 		))
+	}
+	// Every added path of a multipath connection gets a congestion controller of its
+	// own. Brutal never backs off, so an added path uses it only at the bandwidth of
+	// its own (MultipathPath.SendBPS) and BBR otherwise: Brutal at the connection's
+	// rate on each path would send that rate several times over. Careful Resume
+	// applies to the first path only: the parameters saved for the server's address
+	// were measured on that path.
+	newPathCC := func(sendBPS uint64) congestion.CongestionControl {
+		if brutal && sendBPS > 0 {
+			return hyCC.NewBrutalSender(min(sendBPS, actualTx), quicConn.InitialPacketSize(), c.brutalDebug, c.logger)
+		}
+		return congestion_meta2.NewBbrSenderWithProfile(quicConn.InitialPacketSize(), c.bbrProfile)
 	}
 	conn := &clientQUICConnection{
 		quicConn:    quicConn,
@@ -619,6 +635,9 @@ func (c *Client) authenticateAndWrap(ctx context.Context, rawConn io.Closer, cre
 	}
 	if !c.udpDisabled {
 		go c.loopMessages(conn)
+	}
+	if len(c.multipathPaths) > 0 {
+		c.openPaths(conn, newPathCC)
 	}
 	go func() {
 		<-quicConn.Context().Done()
